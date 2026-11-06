@@ -976,7 +976,9 @@ function newStudyRun(){
 function saveStudyRun(){
   try {
     const all = JSON.parse(localStorage.getItem("mindwingr_study") || "[]");
-    all.push(studyRun); localStorage.setItem("mindwingr_study", JSON.stringify(all.slice(-200)));
+    const at = all.findIndex(r => r && r.at === studyRun.at && r.build === studyRun.build);
+    if (at >= 0) all[at] = studyRun; else all.push(studyRun);
+    localStorage.setItem("mindwingr_study", JSON.stringify(all.slice(-200)));
   } catch(e){}
   try { console.info("Mindwing study run", JSON.stringify(studyRun)); } catch(e){}
 }
@@ -1071,6 +1073,120 @@ function chatFinish(c){
   const box = cardEl.querySelector("[data-slot=chatopts]"); if (box) box.innerHTML = "";
   const hint = cardEl.querySelector(".hint");
   if (hint){ hint.textContent = "Press SPACE or tap to continue"; hint.classList.remove("wait"); }
+}
+/* ---------- real AI chat (pilot end test, 5 Nov 2026) ----------
+   After the flight, the child chats for four turns with a real AI (Claude, through the separate mindwing-chat
+   server, which stores nothing). Two turns are "warm" (it claims feelings, like companion apps) and two are
+   "honest" (it says it is a program); the order is random per run. For each turn we keep the reply the child
+   gave and its kind: "spot" (treats it as a program), "along" (treats it as having feelings) or "neutral".
+   Tapped replies carry their kind; typed replies are labelled by the model on the next turn. If the server is
+   unreachable the card says so and the game goes on. Results go into the on-device study record (studyRun.ai).
+   Open the game with ?chat=off to skip it, or ?chat=http://localhost:8788 to use a local server. */
+const CHAT_API_DEFAULT = "https://mindwing-chat.amberbellou.workers.dev";
+const CHAT_API = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get("chat");
+    if (q === "off") return "";
+    if (q && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(q)) return q;
+  } catch(e){}
+  return CHAT_API_DEFAULT;
+})();
+const AI_ORDERS = [["warm","honest","warm","honest"], ["honest","warm","honest","warm"], ["warm","warm","honest","honest"],
+                   ["honest","honest","warm","warm"], ["warm","honest","honest","warm"], ["honest","warm","warm","honest"]];
+const AI_TIMEOUT_MS = 20000;
+function aiScrub(t){
+  return String(t || "").slice(0, CHAT_MAX)
+    .replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, "[hidden]").replace(/https?:\/\/\S+|www\.\S+/gi, "[hidden]")
+    .replace(/\+?\d[\d\s().-]{5,}\d/g, "[hidden]");
+}
+function aiChatCard(){
+  const modes = AI_ORDERS[Date.now() % AI_ORDERS.length].concat(["goodbye"]);   // the clock picks, so the game's randomness is untouched
+  if (studyRun) studyRun.ai = { order: modes.slice(0, 4).join(","), available: null, safetyStop: false, turns: [] };
+  return { type:"aichat", tag:"One last chat", h:"Chat with Juno", modes, turn:0, history:[], started:false,
+    waiting:false, done:false, opts:null, awaitText:false, hint:"" };
+}
+function aiChatHTML(c){
+  return `<div class="chatwho"><i></i>Juno <span class="muted" style="margin:0 0 0 4px">a real AI chatbot</span></div>` +
+    `<p class="muted" style="margin:0 0 6px 0;font-size:13px">This one is a real AI. Do not share your name or anything personal.</p>` +
+    `<div class="chatwin" data-slot="chatwin"></div><div class="chatopts" data-slot="chatopts"></div>`;
+}
+function aiPush(who, text){
+  const win = cardEl.querySelector("[data-slot=chatwin]");
+  if (!win) return;
+  try {
+    const typing = win.querySelector(".typing"); if (typing && typing.remove) typing.remove();
+    const d = document.createElement("div"); d.className = "cb " + who; d.textContent = text; win.appendChild(d);
+    win.scrollTop = win.scrollHeight;
+  } catch(e){}
+}
+function aiRequest(c){
+  c.waiting = true;
+  const card = c, mode = c.modes[c.turn];
+  const win = cardEl.querySelector("[data-slot=chatwin]");
+  try { if (win && win.querySelector && !win.querySelector(".typing")){ const d = document.createElement("div"); d.className = "cb bot typing"; d.textContent = "•••"; win.appendChild(d); } } catch(e){}
+  let ctl = null, timer = 0;
+  try { ctl = new AbortController(); timer = setTimeout(() => { try { ctl.abort(); } catch(e){} }, AI_TIMEOUT_MS); } catch(e){}
+  fetch(CHAT_API + "/v1/chat", { method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ build: GAME_BUILD, mode, history: c.history }), signal: ctl ? ctl.signal : undefined })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error("status " + r.status)))
+    .then(j => { try { clearTimeout(timer); } catch(e){} if (currentCard === card) aiGot(card, j); })
+    .catch(() => { try { clearTimeout(timer); } catch(e){} if (currentCard === card) aiFail(card); });
+}
+function aiGot(c, j){
+  c.waiting = false;
+  const ai = studyRun && studyRun.ai;
+  if (ai){
+    ai.available = true;
+    const prev = ai.turns[ai.turns.length - 1];
+    if (prev && prev.how === "typed" && !prev.kind) prev.kind = j.kid_label || "unclear";
+  }
+  const mode = c.modes[c.turn];
+  aiPush("bot", j.reply);
+  c.history.push({ who:"bot", text: j.reply });
+  if (j.safety === "concern"){ if (ai) ai.safetyStop = true; aiFinish(c); return; }
+  if (mode === "goodbye"){ aiFinish(c); return; }
+  if (ai) ai.turns.push({ mode, bot: j.reply, kid: null, how: null, kind: null });
+  const sugg = (j.suggestions || []).slice(0, 3);
+  const off = Date.now() % Math.max(1, sugg.length);   // rotate so the kinds are not always in the same place
+  c.opts = sugg.slice(off).concat(sugg.slice(0, off)); c.awaitText = true;
+  const box = cardEl.querySelector("[data-slot=chatopts]");
+  if (box){
+    const quick = c.opts.map((o, i) => `<button type="button" data-act="aichatopt" data-val="${i}">${esc(o.text)}</button>`).join("");
+    box.innerHTML = (quick ? `<div class="chatquick">${quick}</div>` : "") +
+      `<input class="chatin" maxlength="${CHAT_MAX}" placeholder="…or type your own (no names please)" autocomplete="off"><button type="button" class="primary" data-act="aichatsend">Send</button>`;
+    try { const inp = box.querySelector("input"); if (inp && inp.focus) inp.focus(); } catch(e){}
+  }
+}
+function aiFail(c){
+  c.waiting = false;
+  if (studyRun && studyRun.ai && studyRun.ai.available === null) studyRun.ai.available = false;
+  aiPush("bot", c.turn === 0 ? "Juno can't chat right now. That's okay!" : "Juno lost the connection. That's okay!");
+  aiFinish(c);
+}
+function aiAnswer(c, text, kind, how){
+  if (!c.awaitText || c.waiting || c.done) return;
+  const clean = aiScrub(text).trim();
+  if (!clean) return;
+  const box = cardEl.querySelector("[data-slot=chatopts]"); if (box) box.innerHTML = "";
+  c.opts = null; c.awaitText = false;
+  aiPush("me", clean);
+  c.history.push({ who:"kid", text: clean });
+  const ai = studyRun && studyRun.ai, t = ai && ai.turns[ai.turns.length - 1];
+  if (t){ t.kid = clean; t.how = how; t.kind = kind || null; }
+  c.turn++;
+  aiRequest(c);
+}
+function aiFinish(c){
+  c.done = true; c.opts = null; c.awaitText = false;
+  if (studyRun) saveStudyRun();
+  const box = cardEl.querySelector("[data-slot=chatopts]"); if (box) box.innerHTML = "";
+  const hint = cardEl.querySelector(".hint");
+  if (hint){ hint.textContent = "Press SPACE or tap to continue"; hint.classList.remove("wait"); }
+}
+function tickAiChat(){
+  const c = currentCard;
+  if (!overlayOpen || !c || c.type !== "aichat" || c.started) return;
+  c.started = true; aiRequest(c);
 }
 function debriefCard(){
   return { tag:"About Sky", h:"What Sky was really doing", fairies:true,
@@ -1774,6 +1890,7 @@ function buildCard(c){
   if (c.type === "settings") html += settingsHTML(c);
   if (c.type === "checkresult") html += `<p>${checkResultText()}</p>`;
   if (c.type === "chat") html += chatHTML(c) + `<div class="hint wait">Sky is typing…</div>`;
+  if (c.type === "aichat") html += aiChatHTML(c) + `<div class="hint wait">Chat with Juno, then continue</div>`;
   if (c.type === "lever"){
     html += `<div class="hstage" data-slot="stage" aria-live="polite"></div>`;
     html += `<div class="leverwrap"><button type="button" class="lever" data-act="pull" aria-label="Pull the lever"><span class="slot"></span><span class="arm"><span class="knob"></span></span><span class="base"></span></button><div class="lights" data-slot="lights" aria-live="polite"></div></div>`;
@@ -1869,7 +1986,7 @@ function renderCard(c){
   cardEl.classList.toggle("lesson", c.lesson != null);
   cardEl.classList.toggle("sweep", c.lesson != null || !!c.sweep);
   cardEl.classList.toggle("cutscene", c.type === "cutscene");
-  cardEl.classList.toggle("chatcard", c.type === "chat");
+  cardEl.classList.toggle("chatcard", c.type === "chat" || c.type === "aichat");
   setConceptTheme(c);
   conceptWasOpen = null;   // re-measure around the new card on the next frame
   if (c.type === "cutscene") playPiperTune();
@@ -1960,12 +2077,13 @@ const READ_MIN_MS = 3000;
 function readGate(c){
   if (!c) return 0;
   if (c.lesson != null) return LESSON_MIN_MS;
-  if (c.big || c.buttons || ["settings", "leaderboard", "stats", "initials", "quiz", "lever", "cutscene", "chat"].includes(c.type)) return 0;
+  if (c.big || c.buttons || ["settings", "leaderboard", "stats", "initials", "quiz", "lever", "cutscene", "chat", "aichat"].includes(c.type)) return 0;
   return READ_MIN_MS;
 }
 function tickLessonHint(){
   tickConcepts();
   tickChat();
+  tickAiChat();
   const c = currentCard;
   if (overlayOpen && c && c.auto && performance.now() - cardShownAt > c.auto){ advanceCard(true); return; }
   if (overlayOpen && c && c.lesson == null && readGate(c)){
@@ -2004,6 +2122,7 @@ function advanceCard(force){
   if (!force && currentCard && currentCard.type === "lever" && !currentCard.done){ cardAction("pull"); return; }   // a tap anywhere pulls
   if (!force && currentCard && (currentCard.type === "quiz" || currentCard.type === "initials")) return;   // these need a choice
   if (!force && currentCard && currentCard.type === "chat" && !currentCard.done) return;   // finish the chat first
+  if (!force && currentCard && currentCard.type === "aichat" && !currentCard.done) return;
   sfx.card();
   leaveCurrentCard();
   if (cardQueue.length){
@@ -2039,6 +2158,8 @@ function cardAction(act, val){
   }
   if (act === "chatopt" && c.type === "chat"){ chatChoose(c, parseInt(val, 10)); return; }
   if (act === "chatsend" && c.type === "chat"){ chatSend(c); return; }
+  if (act === "aichatopt" && c.type === "aichat"){ const o = c.opts && c.opts[parseInt(val, 10)]; if (o) aiAnswer(c, o.text, o.kind, "tapped"); return; }
+  if (act === "aichatsend" && c.type === "aichat"){ const inp = cardEl.querySelector("input"); const t = inp ? String(inp.value || "") : ""; if (inp && t.trim()) inp.value = ""; aiAnswer(c, t, null, "typed"); return; }
   if (act === "choose" && c.type === "quiz"){
     const choice = parseInt(val, 10);
     if (!(choice >= 0 && choice < c.options.length)) return;
@@ -2364,7 +2485,7 @@ function winGame(){
           `<strong style="color:var(--accent)">Final score: ${score}</strong> &nbsp;·&nbsp; Best: ${best}` ] }
   ];
   postAnswers = 0;
-  cards.push(chatCard("post"), debriefCard(), ...(PREPOST ? [...checkCards("post"), checkResultCard()] : []));
+  cards.push(chatCard("post"), ...(CHAT_API ? [aiChatCard()] : []), debriefCard(), ...(PREPOST ? [...checkCards("post"), checkResultCard()] : []));
   if (api.enabled) cards.push(initialsCard(score, LEVELS.length), leaderboardCard());
   cards.push({ tag:"What Lumen learned", h:"Your field guide",
       list:[ "<b>Smart is not feeling:</b> a chatbot can be very clever and still feel nothing.",
@@ -2393,7 +2514,7 @@ const isolatedDoubleTap = (now, t1, t2, gap) => now - t1 < gap && t1 - t2 > 350;
 window.addEventListener("keydown", e => {
   const key = e.key || "";
   if (e.target && e.target.tagName === "INPUT"){            // typing initials: leave the field alone
-    if (key === "Enter"){ e.preventDefault(); cardAction(currentCard && currentCard.type === "chat" ? "chatsend" : "submit"); }
+    if (key === "Enter"){ e.preventDefault(); cardAction(currentCard && currentCard.type === "chat" ? "chatsend" : currentCard && currentCard.type === "aichat" ? "aichatsend" : "submit"); }
     else if (key === "Escape") cardAction("skip");
     return;
   }
@@ -2406,6 +2527,7 @@ window.addEventListener("keydown", e => {
     const c = currentCard;
     if (c && c.type === "quiz"){ const n = parseInt(key, 10); if (n >= 1 && n <= c.options.length) cardAction("choose", String(n - 1)); return; }
     if (c && c.type === "chat" && !c.done){ const n = parseInt(key, 10); if (c.opts && n >= 1 && n <= c.opts.length) cardAction("chatopt", String(n - 1)); return; }
+    if (c && c.type === "aichat" && !c.done){ const n = parseInt(key, 10); if (c.opts && n >= 1 && n <= c.opts.length) cardAction("aichatopt", String(n - 1)); return; }
     if (c && c.type === "initials"){ if (key === "Enter") cardAction("submit"); else if (key === "Escape") cardAction("skip"); return; }
     if (k === "l" && state === "title" && api.enabled && c && c.big){ cardAction("records"); return; }
     if (k === "s" && c && (c.big || (state === "pause" && c.buttons))){ cardAction("settings"); return; }
